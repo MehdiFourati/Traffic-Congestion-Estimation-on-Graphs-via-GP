@@ -4,6 +4,8 @@ __pycache__/
 venv/
 .env
 
+gp/
+
 .ipynb_checkpoints/
 
 build/

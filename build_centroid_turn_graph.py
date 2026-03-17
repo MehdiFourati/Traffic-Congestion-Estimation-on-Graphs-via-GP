@@ -3,13 +3,14 @@ from __future__ import annotations
 import argparse
 import pickle
 from pathlib import Path
-from typing import Optional, Dict, Tuple
+from typing import Dict, Tuple
 
 import pandas as pd
 import networkx as nx
 
 
 def save_gpickle(G: nx.Graph, path: Path) -> None:
+    """Save a NetworkX graph as a pickle file."""
     with open(path, "wb") as f:
         pickle.dump(G, f, protocol=pickle.HIGHEST_PROTOCOL)
 
@@ -19,12 +20,24 @@ def build_centroid_turn_graph(
     connections_csv: Path,
     links_csv: Path,
 ) -> nx.MultiDiGraph:
-    # Load files
+    """
+    Build a directed multigraph where:
+    - each node = a road/link centroid
+    - each edge = a directed turn/connection from one link to another
+
+    Node attributes include centroid coordinates and, when available,
+    segment geometry from the links file.
+    """
+    # -------------------------
+    # 1) Load the CSV files
+    # -------------------------
     df_c = pd.read_csv(centroid_csv)
     df_t = pd.read_csv(connections_csv)
     df_l = pd.read_csv(links_csv)
 
-    # Normalize dtypes
+    # -------------------------
+    # 2) Normalize dtypes
+    # -------------------------
     df_c["id"] = df_c["id"].astype(int)
     df_t["turn"] = df_t["turn"].astype(int)
     df_t["intersection"] = df_t["intersection"].astype(int)
@@ -32,32 +45,45 @@ def build_centroid_turn_graph(
     df_t["dst"] = df_t["dst"].astype(int)
     df_l["id"] = df_l["id"].astype(int)
 
-    # Index link metadata for fast lookup
+    # Fast lookup for link metadata
     links_by_id = df_l.set_index("id", drop=False)
 
-    # Build node set from centroid file and turn file
+    # -------------------------
+    # 3) Build node id set
+    # -------------------------
+    # We start from:
+    # - all ids in centroid_pos.csv
+    # - all ids that appear in connections.csv as origin/destination
+    #
+    # Later, we will remove isolated nodes (degree 0).
     node_ids = set(df_c["id"].tolist())
     node_ids |= set(df_t["org"].tolist())
     node_ids |= set(df_t["dst"].tolist())
 
-    # Centroid positions from centroid_pos.csv
+    # Centroid lookup from centroid_pos.csv
     centroid_pos: Dict[int, Tuple[float, float]] = {
-        int(r.id): (float(r.x), float(r.y)) for r in df_c.itertuples(index=False)
+        int(r.id): (float(r.x), float(r.y))
+        for r in df_c.itertuples(index=False)
     }
 
-    # Create directed multigraph (turns are directed; multiple turns between same pair possible)
+    # -------------------------
+    # 4) Create graph
+    # -------------------------
+    # MultiDiGraph keeps multiple directed turn edges if needed
     G = nx.MultiDiGraph()
 
-    # Add nodes with attributes (centroid + segment geometry)
+    # -------------------------
+    # 5) Add nodes
+    # -------------------------
     for link_id in sorted(node_ids):
         node_attr = {"link_id": int(link_id)}
 
-        # 1) Set node (x,y) centroid
+        # Preferred centroid from centroid_pos.csv
         if link_id in centroid_pos:
             node_attr["x"] = float(centroid_pos[link_id][0])
             node_attr["y"] = float(centroid_pos[link_id][1])
 
-        # 2) Attach geometry and other metadata from link_bboxes_clustered.csv
+        # Attach geometry and metadata from link_bboxes_clustered.csv
         if link_id in links_by_id.index:
             row = links_by_id.loc[link_id]
 
@@ -66,31 +92,36 @@ def build_centroid_turn_graph(
             node_attr["to_x"] = float(row["to_x"])
             node_attr["to_y"] = float(row["to_y"])
 
-            # If centroid is missing, try c_x/c_y or midpoint of endpoints
+            # If centroid is missing, try c_x/c_y
             if "x" not in node_attr or "y" not in node_attr:
                 if "c_x" in links_by_id.columns and "c_y" in links_by_id.columns:
                     try:
-                        node_attr["x"] = float(row["c_x"])
-                        node_attr["y"] = float(row["c_y"])
+                        if pd.notna(row["c_x"]) and pd.notna(row["c_y"]):
+                            node_attr["x"] = float(row["c_x"])
+                            node_attr["y"] = float(row["c_y"])
                     except Exception:
                         pass
 
+            # Final fallback: midpoint of segment endpoints
             if "x" not in node_attr or "y" not in node_attr:
                 node_attr["x"] = 0.5 * (node_attr["from_x"] + node_attr["to_x"])
                 node_attr["y"] = 0.5 * (node_attr["from_y"] + node_attr["to_y"])
 
-            # Add a few useful optional attributes if present
+            # Optional metadata if present
             for col in ["length", "out_ang", "num_lanes", "cluster", "grid_x", "grid_y", "grid_nb"]:
-                if col in links_by_id.columns and pd.notna(row.get(col, None)):
-                    node_attr[col] = row[col]
-
+                if col in links_by_id.columns:
+                    val = row[col]
+                    if pd.notna(val):
+                        node_attr[col] = val
         else:
-            # Node exists in turns but not in link metadata
+            # Node exists in turns/centroids but not in link metadata
             node_attr["missing_link_metadata"] = True
 
         G.add_node(link_id, **node_attr)
 
-    # Add directed turn edges
+    # -------------------------
+    # 6) Add directed turn edges
+    # -------------------------
     for r in df_t.itertuples(index=False):
         turn_id = int(r.turn)
         inter_id = int(r.intersection)
@@ -107,11 +138,22 @@ def build_centroid_turn_graph(
             length=length,
         )
 
+    # -------------------------
+    # 7) Remove isolated nodes
+    # -------------------------
+    # These are nodes with degree 0:
+    # - present in centroid/link metadata
+    # - but not actually connected by any edge
+    isolated_nodes = list(nx.isolates(G))
+    G.remove_nodes_from(isolated_nodes)
+
     return G
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build centroid/turn graph (with segment geometry on nodes).")
+    parser = argparse.ArgumentParser(
+        description="Build centroid/turn graph and remove isolated nodes."
+    )
     parser.add_argument("--metadata-dir", type=Path, default=Path("metadata"), help="Path to metadata folder")
     parser.add_argument("--centroid-csv", type=Path, default=None, help="Override centroid_pos.csv path")
     parser.add_argument("--connections-csv", type=Path, default=None, help="Override connections.csv path")
@@ -127,13 +169,29 @@ def main() -> None:
         if not p.exists():
             raise FileNotFoundError(f"Could not find: {p}")
 
+    # Build once so we can also report how many isolates were removed
+    # by comparing with a temporary pre-pruned graph if needed.
+    #
+    # Easiest clean way: rebuild stats from source files first.
+    df_c = pd.read_csv(centroid_csv)
+    df_t = pd.read_csv(connections_csv)
+
+    initial_node_ids = set(df_c["id"].astype(int).tolist())
+    initial_node_ids |= set(df_t["org"].astype(int).tolist())
+    initial_node_ids |= set(df_t["dst"].astype(int).tolist())
+    initial_node_count = len(initial_node_ids)
+
     G = build_centroid_turn_graph(centroid_csv, connections_csv, links_csv)
+
+    removed_isolates = initial_node_count - G.number_of_nodes()
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     save_gpickle(G, args.out)
 
     print("Centroid/turn graph built")
-    print(f"Nodes: {G.number_of_nodes():,}")
+    print(f"Initial nodes before isolate removal: {initial_node_count:,}")
+    print(f"Removed isolated nodes: {removed_isolates:,}")
+    print(f"Final nodes: {G.number_of_nodes():,}")
     print(f"Edges: {G.number_of_edges():,}")
     print(f"Wrote: {args.out}")
 

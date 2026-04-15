@@ -1,30 +1,23 @@
-from __future__ import annotations
-
-import math
+import json
 import pickle
+import time
+from math import ceil
 from pathlib import Path
 from typing import Any
 
-import time
-import json
 import networkx as nx
 import numpy as np
 import pandas as pd
 import torch
-import gpytorch
+from tqdm import tqdm
 
-# ------------------------------------------------------------------
-# ADAPT THIS IMPORT TO YOUR PROJECT
-# ------------------------------------------------------------------
 from Kernels.graph_matern import GraphMaternKernel
 
 
 # ============================================================
 # CONFIG
 # ============================================================
-from pathlib import Path
 
-# Folder that contains canonical_graph.gpickle, eigenvalues.pt, etc.
 GRAPH_SPECTRUM_DIR = Path(
     r"C:\Users\USER\Documents\GitHub\Traffic-Congestion-Estimation-on-Graphs-via-GP\outputs\graph_spectrum"
 )
@@ -32,20 +25,34 @@ GRAPH_SPECTRUM_DIR = Path(
 GRAPH_PATH = GRAPH_SPECTRUM_DIR / "canonical_graph.gpickle"
 PICKLE_DIR = Path(r"C:\Users\USER\Documents\GitHub\datasets\simbarca\all_agg_trimmed")
 
-TARGET_TIME = "21:00"
-MIN_DEGREE = 4
+TARGET_TIME = "09:00"
 
 TRAIN_FILES = 70
 VAL_FILES = 15
 TEST_FILES = 16
 
-NUM_EPOCHS = 2
+
+OBS_FRACTION = 0.3
+
+# For training, masks are resampled every epoch.
+# For validation/test, masks stay fixed.
+TRAIN_MASKS_PER_DAY = 1
+VAL_MASKS_PER_DAY = 1
+TEST_MASKS_PER_DAY = 1
+
+# Skip rows that do not contain enough available graph nodes
+MIN_AVAILABLE_NODES = 50
+
+
+TRAIN_BATCH_SIZE = 1
+EVAL_BATCH_SIZE = 1
+
+NUM_EPOCHS = 50
 LR = 0.03
 WEIGHT_DECAY = 0.0
 RANDOM_SEED = 42
 
-MIN_NEIGHBORS_PRESENT = 1
-
+# Numerical stabilization
 BASE_JITTER = 1e-5
 MAX_JITTER_TRIES = 6
 
@@ -60,8 +67,7 @@ np.random.seed(RANDOM_SEED)
 # ============================================================
 def materialize_kernel(K: torch.Tensor) -> torch.Tensor:
     """
-    Convert a GPyTorch lazy covariance object into a dense tensor
-    when we need manual linear algebra.
+    Convert a lazy covariance object into a dense tensor when needed.
     """
     if hasattr(K, "to_dense"):
         return K.to_dense()
@@ -71,6 +77,9 @@ def materialize_kernel(K: torch.Tensor) -> torch.Tensor:
 
 
 def symmetrize(M: torch.Tensor) -> torch.Tensor:
+    """
+    Force symmetry numerically.
+    """
     return 0.5 * (M + M.transpose(-1, -2))
 
 
@@ -80,7 +89,7 @@ def stabilize_covariance(
     max_tries: int = MAX_JITTER_TRIES,
 ) -> torch.Tensor:
     """
-    Make covariance numerically safer for Cholesky / MVN operations.
+    Add enough jitter so Cholesky succeeds.
     """
     cov = symmetrize(cov)
     n = cov.shape[-1]
@@ -95,21 +104,84 @@ def stabilize_covariance(
         except RuntimeError:
             jitter *= 10.0
 
-    # Final try; let it fail later if truly broken
+    # Final try; if it still fails later, the matrix is genuinely problematic.
     return cov + jitter * I
 
 
-def compute_metrics(df: pd.DataFrame) -> dict[str, float]:
+def compute_metrics(df: pd.DataFrame, scale: float) -> dict[str, float]:
+    """
+    Compute raw and normalized regression metrics.
+    scale is usually the train standard deviation y_std.
+    """
     if len(df) == 0:
-        return {"mae": float("nan"), "rmse": float("nan")}
+        return {
+            "mae": float("nan"),
+            "rmse": float("nan"),
+            "nmae": float("nan"),
+            "nrmse": float("nan"),
+        }
 
     mae = float(df["abs_error"].mean())
     rmse = float(np.sqrt(df["sq_error"].mean()))
-    return {"mae": mae, "rmse": rmse}
+
+    if scale <= 0:
+        nmae = float("nan")
+        nrmse = float("nan")
+    else:
+        nmae = mae / scale
+        nrmse = rmse / scale
+
+    return {
+        "mae": mae,
+        "rmse": rmse,
+        "nmae": nmae,
+        "nrmse": nrmse,
+    }
+
+
+def num_batches(n_items: int, batch_size: int) -> int:
+    if n_items == 0:
+        return 0
+    return ceil(n_items / batch_size)
+
+
+def iter_task_batches(tasks: list[dict], batch_size: int):
+    """
+    Yield consecutive batches of tasks.
+    """
+    for start in range(0, len(tasks), batch_size):
+        yield tasks[start:start + batch_size]
 
 
 def node_ids_to_positions(node_ids: list[int], node_to_pos: dict[int, int]) -> list[int]:
+    """
+    Convert graph node ids into positions used by the spectral objects.
+    """
     return [node_to_pos[n] for n in node_ids]
+
+
+def task_to_device(task: dict, device: torch.device) -> dict:
+    """
+    Convert one CPU task into device tensors on demand.
+
+    For the whole-graph reconstruction task:
+      - x_obs has shape (n_obs, 1)
+      - y_obs has shape (n_obs,)
+      - x_tgt has shape (n_tgt, 1)
+      - y_tgt has shape (n_tgt,)
+    """
+    x_obs = torch.tensor(task["x_obs_pos"], dtype=torch.float32, device=device).unsqueeze(-1)
+    y_obs = torch.tensor(task["y_obs_std"], dtype=torch.float32, device=device)
+
+    x_tgt = torch.tensor(task["x_tgt_pos"], dtype=torch.float32, device=device).unsqueeze(-1)
+    y_tgt = torch.tensor(task["y_tgt_std"], dtype=torch.float32, device=device)
+
+    return {
+        "x_obs": x_obs,
+        "y_obs": y_obs,
+        "x_tgt": x_tgt,
+        "y_tgt": y_tgt,
+    }
 
 
 # ============================================================
@@ -117,7 +189,7 @@ def node_ids_to_positions(node_ids: list[int], node_to_pos: dict[int, int]) -> l
 # ============================================================
 def extract_pred_vtime_df(obj: Any) -> pd.DataFrame:
     """
-    ADAPT THIS if your pickle structure differs.
+    Adapt this if your pickle structure differs.
 
     Expected:
       - either the pickle itself is a DataFrame
@@ -164,8 +236,7 @@ def load_pred_vtime_df(path: Path) -> pd.DataFrame:
 
 def select_row_nearest_time(df: pd.DataFrame, target_time: str) -> pd.Series:
     """
-    Pick the row whose timestamp is nearest to the requested clock time
-    within a file/day.
+    Pick the row whose timestamp is nearest to the requested clock time.
     """
     if len(df) == 0:
         raise ValueError("Empty dataframe.")
@@ -193,6 +264,7 @@ def load_graph(graph_path: Path) -> nx.Graph:
 
     return G
 
+
 def _load_node_to_pos(spectrum_dir: Path) -> dict[int, int]:
     """
     Prefer node_to_index.json because it is explicit.
@@ -202,23 +274,17 @@ def _load_node_to_pos(spectrum_dir: Path) -> dict[int, int]:
     if json_path.exists():
         with open(json_path, "r") as f:
             raw = json.load(f)
+        return {int(k): int(v) for k, v in raw.items()}
 
-        # JSON keys may be strings
-        node_to_pos = {int(k): int(v) for k, v in raw.items()}
-        return node_to_pos
-
-    # Fallback: reconstruct mapping from node_order
     node_order_pt = spectrum_dir / "node_order.pt"
     node_order_npy = spectrum_dir / "node_order.npy"
 
     if node_order_pt.exists():
         node_order_obj = torch.load(node_order_pt, map_location="cpu")
-
         if isinstance(node_order_obj, torch.Tensor):
             node_order = node_order_obj.tolist()
         else:
             node_order = list(node_order_obj)
-
         return {int(node): i for i, node in enumerate(node_order)}
 
     if node_order_npy.exists():
@@ -228,6 +294,7 @@ def _load_node_to_pos(spectrum_dir: Path) -> dict[int, int]:
     raise FileNotFoundError(
         "Could not find node_to_index.json or node_order.pt/.npy in graph_spectrum."
     )
+
 
 def _load_tensor_file(path: Path) -> torch.Tensor:
     """
@@ -249,14 +316,11 @@ def _load_tensor_file(path: Path) -> torch.Tensor:
 def build_graph_objects(graph_path: Path, spectrum_dir: Path):
     """
     Load:
-      - the graph topology from canonical_graph.gpickle
-      - the precomputed spectral objects from graph_spectrum
-
-    This avoids recomputing eigenvalues/eigenvectors.
+      - graph topology from canonical_graph.gpickle
+      - precomputed spectral objects from graph_spectrum
     """
     G = load_graph(graph_path)
 
-    # Prefer .pt, fallback to .npy
     eigvals_path = spectrum_dir / "eigenvalues.pt"
     eigvecs_path = spectrum_dir / "eigenvectors.pt"
 
@@ -272,7 +336,6 @@ def build_graph_objects(graph_path: Path, spectrum_dir: Path):
 
     eigenvalues = _load_tensor_file(eigvals_path).to(DEVICE)
     eigenvectors = _load_tensor_file(eigvecs_path).to(DEVICE)
-
     node_to_pos = _load_node_to_pos(spectrum_dir)
 
     # Basic consistency checks
@@ -303,9 +366,7 @@ def build_graph_objects(graph_path: Path, spectrum_dir: Path):
             f"node_to_pos has {len(node_to_pos)} entries but eigenvalues has length {eigenvalues.shape[0]}"
         )
 
-    eligible_centers = sorted([int(n) for n in G.nodes() if G.degree[n] >= MIN_DEGREE])
-
-    return G, node_to_pos, eigenvalues, eigenvectors, eligible_centers
+    return G, node_to_pos, eigenvalues, eigenvectors
 
 
 # ============================================================
@@ -338,9 +399,8 @@ def build_day_rows(
 
         t1 = time.time()
         print(
-            f"    loaded dataframe in {t1 - t0:.2f}s | "
-            f"shape={df.shape}",
-            flush=True
+            f"    loaded dataframe in {t1 - t0:.2f}s | shape={df.shape}",
+            flush=True,
         )
 
         row = select_row_nearest_time(df, target_time)
@@ -362,7 +422,7 @@ def build_day_rows(
         print(
             f"    extracted fixed-time row in {time.time() - t1:.2f}s | "
             f"non-missing nodes={len(values)}",
-            flush=True
+            flush=True,
         )
 
     if cache_path is not None:
@@ -374,34 +434,18 @@ def build_day_rows(
     return rows
 
 
-def get_relevant_nodes(G: nx.Graph, eligible_centers: list[int]) -> set[int]:
-    """
-    Nodes whose values are relevant for this task family:
-      - eligible centers
-      - neighbors of eligible centers
-    """
-    relevant = set()
-
-    for c in eligible_centers:
-        relevant.add(c)
-        for nbr in G.neighbors(c):
-            relevant.add(nbr)
-
-    return relevant
-
-
 def fit_standardization(
     train_rows: list[dict],
-    relevant_nodes: set[int],
+    allowed_nodes: set[int],
 ) -> tuple[float, float]:
     """
-    Fit standardization stats using only the training split.
+    Fit normalization stats using all available graph nodes in the train split.
     """
     vals = []
 
     for day in train_rows:
         for node_id, value in day["values"].items():
-            if node_id in relevant_nodes:
+            if node_id in allowed_nodes:
                 vals.append(value)
 
     vals = np.asarray(vals, dtype=float)
@@ -416,61 +460,106 @@ def fit_standardization(
     return mean, std
 
 
-def build_tasks(
+def sample_obs_target_split(
+    available_nodes: list[int],
+    obs_fraction: float,
+    rng: np.random.Generator,
+) -> tuple[list[int], list[int]]:
+    """
+    Randomly split available nodes into:
+      - observed nodes
+      - target nodes
+    """
+    n = len(available_nodes)
+    if n < 2:
+        return [], []
+
+    n_obs = int(round(obs_fraction * n))
+    n_obs = max(1, n_obs)
+    n_obs = min(n_obs, n - 1)
+
+    perm = rng.permutation(n)
+
+    obs_idx = perm[:n_obs]
+    tgt_idx = perm[n_obs:]
+
+    obs_nodes = sorted(available_nodes[i] for i in obs_idx)
+    tgt_nodes = sorted(available_nodes[i] for i in tgt_idx)
+
+    return obs_nodes, tgt_nodes
+
+
+def build_whole_graph_tasks(
     day_rows: list[dict],
-    G: nx.Graph,
-    eligible_centers: list[int],
     node_to_pos: dict[int, int],
     y_mean: float,
     y_std: float,
+    obs_fraction: float,
+    num_masks_per_day: int,
+    base_seed: int,
+    min_available_nodes: int = MIN_AVAILABLE_NODES,
 ) -> list[dict]:
     """
-    For each (day, center), create one task:
+    Build whole-graph reconstruction tasks.
 
-      observed:
-        - center node value only
+    For each selected day/time row:
+      - choose a random observed subset of available graph nodes
+      - predict all remaining available graph nodes
 
-      targets:
-        - all observed neighbors of that center in that day-row
-
-    This matches:
-      "condition on the center node only, predict its neighbors"
+    One day can produce several tasks via different masks.
     """
     tasks = []
+    mapped_nodes = set(node_to_pos.keys())
 
-    for day in day_rows:
+    for day_idx, day in enumerate(day_rows):
         values = day["values"]
 
-        for center in eligible_centers:
-            if center not in values:
+        # Keep only nodes that both:
+        #   - appear in this row
+        #   - exist in the graph spectral mapping
+        available_nodes = sorted([n for n in values if n in mapped_nodes])
+
+        if len(available_nodes) < min_available_nodes:
+            continue
+
+        for mask_idx in range(num_masks_per_day):
+            rng = np.random.default_rng(base_seed + 10000 * day_idx + mask_idx)
+
+            obs_nodes, tgt_nodes = sample_obs_target_split(
+                available_nodes=available_nodes,
+                obs_fraction=obs_fraction,
+                rng=rng,
+            )
+
+            if len(obs_nodes) == 0 or len(tgt_nodes) == 0:
                 continue
 
-            observed_neighbors = sorted([nbr for nbr in G.neighbors(center) if nbr in values])
+            x_obs_pos = node_ids_to_positions(obs_nodes, node_to_pos)
+            x_tgt_pos = node_ids_to_positions(tgt_nodes, node_to_pos)
 
-            if len(observed_neighbors) < MIN_NEIGHBORS_PRESENT:
-                continue
+            y_obs_raw = np.array([values[n] for n in obs_nodes], dtype=np.float32)
+            y_tgt_raw = np.array([values[n] for n in tgt_nodes], dtype=np.float32)
 
-            center_pos = node_to_pos[center]
-            neighbor_positions = node_ids_to_positions(observed_neighbors, node_to_pos)
-
-            y_center_raw = float(values[center])
-            y_neighbors_raw = np.array([values[nbr] for nbr in observed_neighbors], dtype=float)
-
-            y_center_std = (y_center_raw - y_mean) / y_std
-            y_neighbors_std = (y_neighbors_raw - y_mean) / y_std
+            y_obs_std = ((y_obs_raw - y_mean) / y_std).astype(np.float32)
+            y_tgt_std = ((y_tgt_raw - y_mean) / y_std).astype(np.float32)
 
             tasks.append({
                 "file": day["file"],
                 "timestamp": day["timestamp"],
-                "center_node": center,
-                "target_neighbors": observed_neighbors,
-                "num_targets": len(observed_neighbors),
-                "x_obs": torch.tensor([[center_pos]], dtype=torch.float32, device=DEVICE),
-                "y_obs": torch.tensor([y_center_std], dtype=torch.float32, device=DEVICE),
-                "x_tgt": torch.tensor(neighbor_positions, dtype=torch.float32, device=DEVICE).unsqueeze(-1),
-                "y_tgt": torch.tensor(y_neighbors_std, dtype=torch.float32, device=DEVICE),
-                "y_obs_raw": y_center_raw,
-                "y_tgt_raw": y_neighbors_raw,
+                "mask_id": int(mask_idx),
+
+                "observed_nodes": [int(n) for n in obs_nodes],
+                "target_nodes": [int(n) for n in tgt_nodes],
+                "num_obs": len(obs_nodes),
+                "num_targets": len(tgt_nodes),
+
+                "x_obs_pos": [int(p) for p in x_obs_pos],
+                "x_tgt_pos": [int(p) for p in x_tgt_pos],
+                "y_obs_std": y_obs_std,
+                "y_tgt_std": y_tgt_std,
+
+                "y_obs_raw": y_obs_raw,
+                "y_tgt_raw": y_tgt_raw,
             })
 
     return tasks
@@ -481,14 +570,14 @@ def build_tasks(
 # ============================================================
 class SharedConditionalGraphModel(torch.nn.Module):
     """
-    Shared graph kernel + shared constant mean + shared observation noise.
+    Shared graph Matérn kernel + shared constant mean + shared noise.
 
     For each task:
-      observe center node value
-      predict neighbor values
+      - observe a subset of graph nodes
+      - predict the remaining nodes
 
     We optimize the conditional Gaussian negative log-likelihood:
-      -log p(y_neighbors | y_center)
+      -log p(y_target | y_observed)
     """
     def __init__(
         self,
@@ -506,7 +595,7 @@ class SharedConditionalGraphModel(torch.nn.Module):
         # Global mean for the standardized process
         self.raw_mean = torch.nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
 
-        # Positive noise via softplus
+        # Positive observation noise via softplus
         self.raw_noise = torch.nn.Parameter(torch.tensor(-2.0, dtype=torch.float32))
 
         self.base_jitter = float(base_jitter)
@@ -524,12 +613,12 @@ class SharedConditionalGraphModel(torch.nn.Module):
 
     def conditional_distribution(
         self,
-        x_obs: torch.Tensor,   # shape (1, 1)
-        y_obs: torch.Tensor,   # shape (1,)
-        x_tgt: torch.Tensor,   # shape (m, 1)
+        x_obs: torch.Tensor,   # shape (n_obs, 1)
+        y_obs: torch.Tensor,   # shape (n_obs,)
+        x_tgt: torch.Tensor,   # shape (n_tgt, 1)
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Returns the predictive Gaussian distribution:
+        Compute the predictive Gaussian distribution:
 
             y_tgt | y_obs ~ N(pred_mean, pred_cov)
 
@@ -538,12 +627,11 @@ class SharedConditionalGraphModel(torch.nn.Module):
         noise = self.noise
 
         # Kernel blocks
-        K_oo = self._cov(x_obs, x_obs)        # (1,1)
-        K_ot = self._cov(x_obs, x_tgt)        # (1,m)
-        K_to = K_ot.transpose(-1, -2)         # (m,1)
-        K_tt = self._cov(x_tgt, x_tgt)        # (m,m)
+        K_oo = self._cov(x_obs, x_obs)              # (n_obs, n_obs)
+        K_ot = self._cov(x_obs, x_tgt)              # (n_obs, n_tgt)
+        K_to = K_ot.transpose(-1, -2)               # (n_tgt, n_obs)
+        K_tt = self._cov(x_tgt, x_tgt)              # (n_tgt, n_tgt)
 
-        # Add observation noise on observed and target sides
         I_obs = torch.eye(K_oo.shape[-1], device=K_oo.device, dtype=K_oo.dtype)
         I_tgt = torch.eye(K_tt.shape[-1], device=K_tt.device, dtype=K_tt.dtype)
 
@@ -553,14 +641,14 @@ class SharedConditionalGraphModel(torch.nn.Module):
         K_oo_noisy = stabilize_covariance(K_oo_noisy, base_jitter=self.base_jitter)
         K_tt_noisy = stabilize_covariance(K_tt_noisy, base_jitter=self.base_jitter)
 
-        mean_obs = self.mean.expand(x_obs.shape[0])   # (1,)
-        mean_tgt = self.mean.expand(x_tgt.shape[0])   # (m,)
+        mean_obs = self.mean.expand(x_obs.shape[0])   # (n_obs,)
+        mean_tgt = self.mean.expand(x_tgt.shape[0])   # (n_tgt,)
 
-        resid = (y_obs - mean_obs).unsqueeze(-1)      # (1,1)
+        resid = (y_obs - mean_obs).unsqueeze(-1)      # (n_obs, 1)
 
-        alpha = torch.linalg.solve(K_oo_noisy, resid)     # (1,1)
-        pred_mean = mean_tgt.unsqueeze(-1) + K_to @ alpha
-        pred_mean = pred_mean.squeeze(-1)                 # (m,)
+        alpha = torch.linalg.solve(K_oo_noisy, resid)                     # (n_obs, 1)
+        pred_mean = mean_tgt.unsqueeze(-1) + K_to @ alpha                # (n_tgt, 1)
+        pred_mean = pred_mean.squeeze(-1)                                # (n_tgt,)
 
         pred_cov = K_tt_noisy - K_to @ torch.linalg.solve(K_oo_noisy, K_ot)
         pred_cov = stabilize_covariance(pred_cov, base_jitter=self.base_jitter)
@@ -573,13 +661,21 @@ class SharedConditionalGraphModel(torch.nn.Module):
         y_obs: torch.Tensor,
         x_tgt: torch.Tensor,
         y_tgt: torch.Tensor,
+        normalize_by_targets: bool = True,
     ) -> torch.Tensor:
         """
-        Negative log-likelihood for one (day, center) task.
+        Negative log-likelihood for one whole-graph reconstruction task.
         """
         pred_mean, pred_cov = self.conditional_distribution(x_obs, y_obs, x_tgt)
         dist = torch.distributions.MultivariateNormal(pred_mean, covariance_matrix=pred_cov)
-        return -dist.log_prob(y_tgt)
+        nll = -dist.log_prob(y_tgt)
+
+        # This keeps the scale of the loss more comparable across tasks,
+        # since target size can vary.
+        if normalize_by_targets:
+            nll = nll / max(int(y_tgt.numel()), 1)
+
+        return nll
 
 
 # ============================================================
@@ -591,60 +687,82 @@ def evaluate_tasks(
     tasks: list[dict],
     y_mean: float,
     y_std: float,
+    batch_size: int = EVAL_BATCH_SIZE,
+    split_name: str = "Eval",
+    show_progress: bool = True,
 ) -> tuple[pd.DataFrame, list[dict]]:
     """
+    Evaluate a list of tasks.
+
     Returns:
-      - a row-level dataframe with one row per predicted neighbor
-      - a list of full predictive covariance records, one per task
+      - row-level dataframe with one row per predicted node
+      - covariance records, one per task
     """
     model.eval()
 
     rows = []
     covariance_records = []
 
-    for task in tasks:
-        pred_mean_std, pred_cov_std = model.conditional_distribution(
-            x_obs=task["x_obs"],
-            y_obs=task["y_obs"],
-            x_tgt=task["x_tgt"],
+    batches = iter_task_batches(tasks, batch_size)
+    total_batches = num_batches(len(tasks), batch_size)
+
+    if show_progress:
+        batches = tqdm(
+            batches,
+            total=total_batches,
+            desc=split_name,
+            unit="batch",
+            leave=False,
         )
 
-        pred_mean_std_np = pred_mean_std.detach().cpu().numpy()
-        pred_cov_std_np = pred_cov_std.detach().cpu().numpy()
+    for batch in batches:
+        for task in batch:
+            dev_task = task_to_device(task, DEVICE)
 
-        pred_var_std_np = np.diag(pred_cov_std_np)
-        pred_std_std_np = np.sqrt(np.maximum(pred_var_std_np, 1e-12))
+            pred_mean_std, pred_cov_std = model.conditional_distribution(
+                x_obs=dev_task["x_obs"],
+                y_obs=dev_task["y_obs"],
+                x_tgt=dev_task["x_tgt"],
+            )
 
-        pred_mean_raw = pred_mean_std_np * y_std + y_mean
-        pred_std_raw = pred_std_std_np * y_std
-        true_raw = task["y_tgt_raw"]
+            pred_mean_std_np = pred_mean_std.detach().cpu().numpy()
+            pred_cov_std_np = pred_cov_std.detach().cpu().numpy()
 
-        # Save full covariance for this (day, center) task
-        covariance_records.append({
-            "file": task["file"],
-            "timestamp": str(task["timestamp"]),
-            "center_node": int(task["center_node"]),
-            "target_neighbors": [int(n) for n in task["target_neighbors"]],
-            "pred_mean_raw": pred_mean_raw.astype(float),
-            "pred_cov_raw": (pred_cov_std_np * (y_std ** 2)).astype(float),
-            "true_values_raw": true_raw.astype(float),
-            "center_value_raw": float(task["y_obs_raw"]),
-        })
+            pred_var_std_np = np.diag(pred_cov_std_np)
+            pred_std_std_np = np.sqrt(np.maximum(pred_var_std_np, 1e-12))
 
-        # Save one row per neighbor
-        for k, nbr in enumerate(task["target_neighbors"]):
-            rows.append({
+            pred_mean_raw = pred_mean_std_np * y_std + y_mean
+            pred_std_raw = pred_std_std_np * y_std
+            true_raw = task["y_tgt_raw"]
+
+            covariance_records.append({
                 "file": task["file"],
-                "timestamp": task["timestamp"],
-                "center_node": int(task["center_node"]),
-                "center_value": float(task["y_obs_raw"]),
-                "target_neighbor": int(nbr),
-                "pred_mean": float(pred_mean_raw[k]),
-                "pred_std": float(pred_std_raw[k]),
-                "true_value": float(true_raw[k]),
-                "abs_error": float(abs(pred_mean_raw[k] - true_raw[k])),
-                "sq_error": float((pred_mean_raw[k] - true_raw[k]) ** 2),
+                "timestamp": str(task["timestamp"]),
+                "mask_id": int(task["mask_id"]),
+                "observed_nodes": [int(n) for n in task["observed_nodes"]],
+                "target_nodes": [int(n) for n in task["target_nodes"]],
+                "pred_mean_raw": pred_mean_raw.astype(float),
+                "pred_cov_raw": (pred_cov_std_np * (y_std ** 2)).astype(float),
+                "true_values_raw": true_raw.astype(float),
+                "observed_values_raw": task["y_obs_raw"].astype(float),
             })
+
+            for k, node_id in enumerate(task["target_nodes"]):
+                rows.append({
+                    "file": task["file"],
+                    "timestamp": task["timestamp"],
+                    "mask_id": int(task["mask_id"]),
+                    "num_obs": int(task["num_obs"]),
+                    "num_targets": int(task["num_targets"]),
+                    "target_node": int(node_id),
+                    "pred_mean": float(pred_mean_raw[k]),
+                    "pred_std": float(pred_std_raw[k]),
+                    "true_value": float(true_raw[k]),
+                    "abs_error": float(abs(pred_mean_raw[k] - true_raw[k])),
+                    "sq_error": float((pred_mean_raw[k] - true_raw[k]) ** 2),
+                    "norm_abs_error": float(abs(pred_mean_raw[k] - true_raw[k]) / y_std),
+                    "norm_sq_error": float(((pred_mean_raw[k] - true_raw[k]) / y_std) ** 2),
+                })
 
     return pd.DataFrame(rows), covariance_records
 
@@ -675,16 +793,12 @@ def main():
     # --------------------------------------------------------
     # Graph objects
     # --------------------------------------------------------
-    G, node_to_pos, eigenvalues, eigenvectors, eligible_centers = build_graph_objects(
-    GRAPH_PATH,
-    GRAPH_SPECTRUM_DIR,
+    G, node_to_pos, eigenvalues, eigenvectors = build_graph_objects(
+        GRAPH_PATH,
+        GRAPH_SPECTRUM_DIR,
     )
 
-    print(f"Eligible centers with degree >= {MIN_DEGREE}: {len(eligible_centers)}")
-    print("First 10 eligible centers and degrees:")
-    for n in eligible_centers[:10]:
-        print(f"  node={n}, degree={G.degree[n]}")
-
+    print(f"Graph nodes: {len(G.nodes())}")
     print("Loaded precomputed spectrum:")
     print("  eigenvalues shape :", tuple(eigenvalues.shape))
     print("  eigenvectors shape:", tuple(eigenvectors.shape))
@@ -713,30 +827,65 @@ def main():
     # --------------------------------------------------------
     # Fit normalization on train only
     # --------------------------------------------------------
-    relevant_nodes = get_relevant_nodes(G, eligible_centers)
-    y_mean, y_std = fit_standardization(train_rows, relevant_nodes)
+    all_graph_nodes = set(node_to_pos.keys())
+    y_mean, y_std = fit_standardization(train_rows, all_graph_nodes)
 
     print(f"Train normalization mean = {y_mean:.6f}")
     print(f"Train normalization std  = {y_std:.6f}")
 
     # --------------------------------------------------------
-    # Build tasks
+    # Build fixed validation / test tasks
     # --------------------------------------------------------
-    train_tasks = build_tasks(train_rows, G, eligible_centers, node_to_pos, y_mean, y_std)
-    val_tasks = build_tasks(val_rows, G, eligible_centers, node_to_pos, y_mean, y_std)
-    test_tasks = build_tasks(test_rows, G, eligible_centers, node_to_pos, y_mean, y_std)
+    val_tasks = build_whole_graph_tasks(
+        day_rows=val_rows,
+        node_to_pos=node_to_pos,
+        y_mean=y_mean,
+        y_std=y_std,
+        obs_fraction=OBS_FRACTION,
+        num_masks_per_day=VAL_MASKS_PER_DAY,
+        base_seed=RANDOM_SEED + 10_000,
+        min_available_nodes=MIN_AVAILABLE_NODES,
+    )
 
-    print(f"Train tasks: {len(train_tasks)}")
-    print(f"Val tasks:   {len(val_tasks)}")
-    print(f"Test tasks:  {len(test_tasks)}")
+    test_tasks = build_whole_graph_tasks(
+        day_rows=test_rows,
+        node_to_pos=node_to_pos,
+        y_mean=y_mean,
+        y_std=y_std,
+        obs_fraction=OBS_FRACTION,
+        num_masks_per_day=TEST_MASKS_PER_DAY,
+        base_seed=RANDOM_SEED + 20_000,
+        min_available_nodes=MIN_AVAILABLE_NODES,
+    )
 
-    if len(train_tasks) == 0:
+    # Warm-up build to verify train tasks exist
+    warmup_train_tasks = build_whole_graph_tasks(
+        day_rows=train_rows,
+        node_to_pos=node_to_pos,
+        y_mean=y_mean,
+        y_std=y_std,
+        obs_fraction=OBS_FRACTION,
+        num_masks_per_day=TRAIN_MASKS_PER_DAY,
+        base_seed=RANDOM_SEED,
+        min_available_nodes=MIN_AVAILABLE_NODES,
+    )
+
+    print(f"Warm-up train tasks: {len(warmup_train_tasks)}")
+    print(f"Val tasks:           {len(val_tasks)}")
+    print(f"Test tasks:          {len(test_tasks)}")
+
+    if len(warmup_train_tasks) == 0:
         raise RuntimeError(
-            "No training tasks were built. Check:\n"
-            "  - file ordering\n"
-            "  - target time selection\n"
-            "  - dataframe key in the pickles\n"
-            "  - node id alignment"
+            "No training tasks were built for whole-graph reconstruction. Check:\n"
+            "  - node id alignment\n"
+            "  - missingness in the selected time row\n"
+            "  - MIN_AVAILABLE_NODES\n"
+            "  - OBS_FRACTION"
+        )
+
+    if len(val_tasks) == 0 or len(test_tasks) == 0:
+        raise RuntimeError(
+            "Validation/test tasks are empty. Check missingness and MIN_AVAILABLE_NODES."
         )
 
     # --------------------------------------------------------
@@ -759,101 +908,209 @@ def main():
         weight_decay=WEIGHT_DECAY,
     )
 
+    history = []
     best_state = None
     best_val_rmse = float("inf")
+    best_epoch = -1
 
     # --------------------------------------------------------
     # Training loop
     # --------------------------------------------------------
-    for epoch in range(1, NUM_EPOCHS + 1):
+    epoch_bar = tqdm(range(1, NUM_EPOCHS + 1), desc="Training", unit="epoch")
+
+    for epoch in epoch_bar:
         model.train()
-        optimizer.zero_grad()
 
-        total_loss = torch.tensor(0.0, device=DEVICE)
+        # Resample training masks every epoch
+        train_tasks = build_whole_graph_tasks(
+            day_rows=train_rows,
+            node_to_pos=node_to_pos,
+            y_mean=y_mean,
+            y_std=y_std,
+            obs_fraction=OBS_FRACTION,
+            num_masks_per_day=TRAIN_MASKS_PER_DAY,
+            base_seed=RANDOM_SEED + 100_000 * epoch,
+            min_available_nodes=MIN_AVAILABLE_NODES,
+        )
 
-        for task in train_tasks:
-            task_loss = model.task_nll(
-                x_obs=task["x_obs"],
-                y_obs=task["y_obs"],
-                x_tgt=task["x_tgt"],
-                y_tgt=task["y_tgt"],
-            )
-            total_loss = total_loss + task_loss
+        if len(train_tasks) == 0:
+            raise RuntimeError(f"No training tasks built at epoch {epoch}.")
 
-        total_loss = total_loss / len(train_tasks)
-        total_loss.backward()
-        optimizer.step()
+        running_loss = 0.0
+        seen_tasks = 0
 
+        train_batches = iter_task_batches(train_tasks, TRAIN_BATCH_SIZE)
+        total_train_batches = num_batches(len(train_tasks), TRAIN_BATCH_SIZE)
+
+        train_batch_bar = tqdm(
+            train_batches,
+            total=total_train_batches,
+            desc=f"Epoch {epoch}/{NUM_EPOCHS} [train]",
+            unit="batch",
+            leave=False,
+        )
+
+        for batch in train_batch_bar:
+            optimizer.zero_grad(set_to_none=True)
+
+            batch_loss = torch.tensor(0.0, dtype=torch.float32, device=DEVICE)
+
+            for task in batch:
+                dev_task = task_to_device(task, DEVICE)
+
+                task_loss = model.task_nll(
+                    x_obs=dev_task["x_obs"],
+                    y_obs=dev_task["y_obs"],
+                    x_tgt=dev_task["x_tgt"],
+                    y_tgt=dev_task["y_tgt"],
+                    normalize_by_targets=True,
+                )
+                batch_loss = batch_loss + task_loss
+
+            batch_loss = batch_loss / len(batch)
+            batch_loss.backward()
+            optimizer.step()
+
+            running_loss += float(batch_loss.detach().cpu()) * len(batch)
+            seen_tasks += len(batch)
+
+            train_batch_bar.set_postfix(avg_nll=f"{running_loss / max(seen_tasks, 1):.4f}")
+
+        avg_train_loss = running_loss / max(seen_tasks, 1)
+
+        # -------------------------
         # Validation
-        val_df, _ = evaluate_tasks(model, val_tasks, y_mean, y_std)
-        val_metrics = compute_metrics(val_df)
+        # -------------------------
+        val_df, _ = evaluate_tasks(
+            model=model,
+            tasks=val_tasks,
+            y_mean=y_mean,
+            y_std=y_std,
+            batch_size=EVAL_BATCH_SIZE,
+            split_name=f"Epoch {epoch}/{NUM_EPOCHS} [val]",
+            show_progress=True,
+        )
+
+        val_metrics = compute_metrics(val_df, scale=y_std)
         val_rmse = val_metrics["rmse"]
+
+        history.append({
+            "epoch": epoch,
+            "train_nll": float(avg_train_loss),
+            "val_mae": float(val_metrics["mae"]),
+            "val_rmse": float(val_metrics["rmse"]),
+            "val_nmae": float(val_metrics["nmae"]),
+            "val_nrmse": float(val_metrics["nrmse"]),
+            "nu": float(model.kernel.nu.item()),
+            "kappa": float(model.kernel.kappa.item()),
+            "outputscale": float(model.kernel.outputscale.item()),
+            "mean": float(model.mean.item()),
+            "noise": float(model.noise.item()),
+        })
 
         if val_rmse < best_val_rmse:
             best_val_rmse = val_rmse
+            best_epoch = epoch
             best_state = {
-                "model_state": {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                "epoch": epoch,
+                "model_state": {k: v.detach().cpu().clone() for k, v in model.state_dict().items()},
+                "val_metrics": dict(val_metrics),
             }
 
-        if epoch == 1 or epoch % 10 == 0 or epoch == NUM_EPOCHS:
-            print(
-                f"Epoch {epoch:03d} | "
-                f"Train NLL: {total_loss.item():.4f} | "
-                f"Val RMSE: {val_rmse:.4f} | "
-                f"nu: {model.kernel.nu.item():.4f} | "
-                f"kappa: {model.kernel.kappa.item():.4f} | "
-                f"outputscale: {model.kernel.outputscale.item():.4f} | "
-                f"mean: {model.mean.item():.4f} | "
-                f"noise: {model.noise.item():.4f}"
-            )
+        epoch_bar.set_postfix(
+            train_nll=f"{avg_train_loss:.4f}",
+            val_nmae=f"{val_metrics['nmae']:.4f}",
+            val_nrmse=f"{val_metrics['nrmse']:.4f}",
+        )
 
-    # --------------------------------------------------------
-    # Restore best state
-    # --------------------------------------------------------
-    if best_state is not None:
-        model.load_state_dict(best_state["model_state"])
+        print(
+            f"Epoch {epoch:03d} | "
+            f"Train NLL: {avg_train_loss:.4f} | "
+            f"Val MAE: {val_metrics['mae']:.4f} | "
+            f"Val RMSE: {val_metrics['rmse']:.4f} | "
+            f"Val NMAE: {val_metrics['nmae']:.4f} | "
+            f"Val NRMSE: {val_metrics['nrmse']:.4f} | "
+            f"nu: {model.kernel.nu.item():.4f} | "
+            f"kappa: {model.kernel.kappa.item():.4f} | "
+            f"outputscale: {model.kernel.outputscale.item():.4f} | "
+            f"mean: {model.mean.item():.4f} | "
+            f"noise: {model.noise.item():.4f}"
+        )
+
+    if best_state is None:
+        raise RuntimeError("No best checkpoint was saved.")
+
+    print(f"\nRestoring best model from epoch {best_state['epoch']}")
+    print("Best validation metrics:", best_state["val_metrics"])
+
+    model.load_state_dict(best_state["model_state"])
 
     # --------------------------------------------------------
     # Final evaluation
     # --------------------------------------------------------
-    val_df, val_cov_records = evaluate_tasks(model, val_tasks, y_mean, y_std)
-    test_df, test_cov_records = evaluate_tasks(model, test_tasks, y_mean, y_std)
+    val_df, val_cov_records = evaluate_tasks(
+        model=model,
+        tasks=val_tasks,
+        y_mean=y_mean,
+        y_std=y_std,
+        batch_size=EVAL_BATCH_SIZE,
+        split_name="Final validation",
+        show_progress=True,
+    )
 
-    val_metrics = compute_metrics(val_df)
-    test_metrics = compute_metrics(test_df)
+    test_df, test_cov_records = evaluate_tasks(
+        model=model,
+        tasks=test_tasks,
+        y_mean=y_mean,
+        y_std=y_std,
+        batch_size=EVAL_BATCH_SIZE,
+        split_name="Final test",
+        show_progress=True,
+    )
+
+    val_metrics = compute_metrics(val_df, scale=y_std)
+    test_metrics = compute_metrics(test_df, scale=y_std)
 
     print("\nValidation")
-    print(f"MAE:  {val_metrics['mae']:.4f}")
-    print(f"RMSE: {val_metrics['rmse']:.4f}")
+    print(f"MAE:   {val_metrics['mae']:.4f}")
+    print(f"RMSE:  {val_metrics['rmse']:.4f}")
+    print(f"NMAE:  {val_metrics['nmae']:.4f}")
+    print(f"NRMSE: {val_metrics['nrmse']:.4f}")
 
     print("\nTest")
-    print(f"MAE:  {test_metrics['mae']:.4f}")
-    print(f"RMSE: {test_metrics['rmse']:.4f}")
+    print(f"MAE:   {test_metrics['mae']:.4f}")
+    print(f"RMSE:  {test_metrics['rmse']:.4f}")
+    print(f"NMAE:  {test_metrics['nmae']:.4f}")
+    print(f"NRMSE: {test_metrics['nrmse']:.4f}")
 
     if len(test_df) > 0:
-        print("\nTest by center node (top 20 by count)")
-        by_center = (
-            test_df.groupby("center_node")
+        print("\nTest by target node (top 20 by count)")
+        by_target = (
+            test_df.groupby("target_node")
             .agg(
-                count=("center_node", "size"),
+                count=("target_node", "size"),
                 mae=("abs_error", "mean"),
                 rmse=("sq_error", lambda s: float(np.sqrt(np.mean(s)))),
             )
             .sort_values("count", ascending=False)
             .head(20)
         )
-        print(by_center)
+        print(by_target)
 
     # --------------------------------------------------------
     # Save outputs
     # --------------------------------------------------------
-    out_dir = Path("outputs_multi_center_fixed_time")
+    out_dir = Path("outputs_whole_graph_fixed_time")
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    history_df = pd.DataFrame(history)
+    history_df.to_csv(out_dir / "training_history.csv", index=False)
+
+    torch.save(best_state, out_dir / "best_checkpoint.pt")
 
     val_df.to_csv(out_dir / "val_predictions.csv", index=False)
     test_df.to_csv(out_dir / "test_predictions.csv", index=False)
 
-    # Full predictive covariance per (day, center) task
     torch.save(val_cov_records, out_dir / "val_task_covariances.pt")
     torch.save(test_cov_records, out_dir / "test_task_covariances.pt")
 
@@ -861,15 +1118,20 @@ def main():
         {
             "model_state_dict": model.state_dict(),
             "target_time": TARGET_TIME,
-            "min_degree": MIN_DEGREE,
-            "eligible_centers": eligible_centers,
+            "obs_fraction": OBS_FRACTION,
+            "train_masks_per_day": TRAIN_MASKS_PER_DAY,
+            "val_masks_per_day": VAL_MASKS_PER_DAY,
+            "test_masks_per_day": TEST_MASKS_PER_DAY,
+            "min_available_nodes": MIN_AVAILABLE_NODES,
             "y_mean": y_mean,
             "y_std": y_std,
+            "node_to_pos": node_to_pos,
         },
         out_dir / "shared_model.pt",
     )
 
-    print(f"\nSaved outputs to: {out_dir.resolve()}")
+    print(f"\nBest epoch: {best_epoch}")
+    print(f"Saved outputs to: {out_dir.resolve()}")
 
 
 if __name__ == "__main__":

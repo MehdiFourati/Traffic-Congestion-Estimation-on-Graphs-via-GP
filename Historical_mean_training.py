@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import pickle
 import time
+from collections import defaultdict
 from math import ceil
 from pathlib import Path
 from typing import Any
@@ -33,28 +34,17 @@ TRAIN_FILES = 70
 VAL_FILES = 15
 TEST_FILES = 16
 
-# Fraction of center-time available nodes revealed to the model
 OBS_FRACTION = 0.3
 
-# Only used if USE_CENTRAL_NODE_RADIUS_FILTER = False
-MIN_GRAPH_DEGREE = 1000
-
-# Minimum number of available nodes at the center timestamp to build a task.
+MIN_GRAPH_DEGREE = 3
 MIN_AVAILABLE_NODES = 20
 
 # ------------------------------------------------------------
-# Local graph
+# Local graph / central-node ablation
 # ------------------------------------------------------------
 USE_CENTRAL_NODE_RADIUS_FILTER = True
-
-# Hard-coded best central node
 CENTRAL_NODE_ID = 8276
-
-# Keep only nodes <= this many graph edges away from CENTRAL_NODE_ID
 GRAPH_RADIUS_EDGES = 5
-
-# Optional degree filter inside the local radius ball.
-# Keep at 0 to keep every mapped node within 5 hops.
 LOCAL_MIN_GRAPH_DEGREE = 0
 
 # ------------------------------------------------------------
@@ -67,16 +57,16 @@ USE_FIXED_OBSERVED_NODES = True
 FIXED_OBSERVED_NODE_IDS = None
 
 # ------------------------------------------------------------
+# Historical-mean training ablation
+# ------------------------------------------------------------
+USE_HISTORICAL_MEAN_TRAINING = True
+
+# ------------------------------------------------------------
 # Temporal task construction
 # ------------------------------------------------------------
-# For each center timestamp, use rows in [center - w, ..., center + w]
 TEMPORAL_WINDOW_STEPS = 10
-
-# Build one task every CENTER_TIME_STRIDE timestamps inside each file
 CENTER_TIME_STRIDE = 5
-
-# Cap the number of non-center temporal observations to avoid huge covariances
-MAX_NEIGHBOR_POINTS = 2500
+MAX_NEIGHBOR_POINTS = 5000
 
 # Since observed nodes are fixed, more than 1 task per center would duplicate tasks.
 TRAIN_TASKS_PER_CENTER = 1
@@ -88,16 +78,13 @@ MAX_TRAIN_EVAL_TASKS = 300
 TRAIN_BATCH_SIZE = 1
 EVAL_BATCH_SIZE = 1
 
-NUM_EPOCHS = 10
+NUM_EPOCHS = 200
 LR = 0.01
 WEIGHT_DECAY = 0.0
 RANDOM_SEED = 42
 
-# No resampling:
-# train masks are built once before training and reused every epoch.
 RESAMPLE_TRAIN_MASKS = False
 
-# Numerical stabilization
 BASE_JITTER = 1e-5
 MAX_JITTER_TRIES = 6
 
@@ -120,6 +107,7 @@ WANDB_RUN_NAME = (
     f"central_{CENTRAL_NODE_ID}"
     f"_r_{GRAPH_RADIUS_EDGES}"
     f"_fixed_obs_{OBS_FRACTION}"
+    f"_histmean_train"
     f"_tw_{TEMPORAL_WINDOW_STEPS}"
     f"_stride_{CENTER_TIME_STRIDE}"
     f"_lr_{LR}"
@@ -131,9 +119,6 @@ WANDB_RUN_NAME = (
 # UTILS
 # ============================================================
 def materialize_kernel(K: torch.Tensor) -> torch.Tensor:
-    """
-    Convert a lazy covariance object into a dense tensor when needed.
-    """
     if hasattr(K, "to_dense"):
         return K.to_dense()
     if hasattr(K, "evaluate"):
@@ -142,9 +127,6 @@ def materialize_kernel(K: torch.Tensor) -> torch.Tensor:
 
 
 def symmetrize(M: torch.Tensor) -> torch.Tensor:
-    """
-    Force symmetry numerically.
-    """
     return 0.5 * (M + M.transpose(-1, -2))
 
 
@@ -153,9 +135,6 @@ def stabilize_covariance(
     base_jitter: float = BASE_JITTER,
     max_tries: int = MAX_JITTER_TRIES,
 ) -> torch.Tensor:
-    """
-    Add enough jitter so Cholesky succeeds.
-    """
     cov = symmetrize(cov)
     n = cov.shape[-1]
     I = torch.eye(n, device=cov.device, dtype=cov.dtype)
@@ -173,10 +152,6 @@ def stabilize_covariance(
 
 
 def compute_metrics(df: pd.DataFrame, scale: float) -> dict[str, float]:
-    """
-    Compute raw and normalized regression metrics.
-    scale is usually the train standard deviation y_std.
-    """
     if len(df) == 0:
         return {
             "mae": float("nan"),
@@ -214,21 +189,7 @@ def iter_task_batches(tasks: list[dict], batch_size: int):
         yield tasks[start:start + batch_size]
 
 
-def node_ids_to_positions(node_ids: list[int], node_to_pos: dict[int, int]) -> list[int]:
-    """
-    Convert graph node ids into spectral positions used by the eigenvector matrix.
-    """
-    return [node_to_pos[n] for n in node_ids]
-
-
 def task_to_device(task: dict, device: torch.device) -> dict:
-    """
-    Convert one CPU task into device tensors.
-
-    Spatiotemporal format:
-      x[..., 0] = node position in spectral ordering
-      x[..., 1] = time
-    """
     x_obs = torch.tensor(task["x_obs_st"], dtype=torch.float32, device=device)
     y_obs = torch.tensor(task["y_obs_std"], dtype=torch.float32, device=device)
 
@@ -244,9 +205,6 @@ def task_to_device(task: dict, device: torch.device) -> dict:
 
 
 def time_of_day_hours(index: pd.DatetimeIndex) -> np.ndarray:
-    """
-    Convert a DatetimeIndex to float hours in [0, 24).
-    """
     return (
         index.hour.to_numpy(dtype=np.float32)
         + index.minute.to_numpy(dtype=np.float32) / 60.0
@@ -258,13 +216,6 @@ def time_of_day_hours(index: pd.DatetimeIndex) -> np.ndarray:
 # PICKLE / DATAFRAME LOADING
 # ============================================================
 def extract_pred_vtime_df(obj: Any) -> pd.DataFrame:
-    """
-    Adapt this if your pickle structure differs.
-
-    Expected:
-      - either the pickle itself is a DataFrame
-      - or it is a dict containing a DataFrame under one of these keys
-    """
     if isinstance(obj, pd.DataFrame):
         return obj
 
@@ -291,11 +242,9 @@ def load_pred_vtime_df(path: Path) -> pd.DataFrame:
 
     df = extract_pred_vtime_df(obj).copy()
 
-    # Force datetime index
     if not isinstance(df.index, pd.DatetimeIndex):
         df.index = pd.to_datetime(df.index)
 
-    # Try to cast columns to integer node ids
     try:
         df.columns = pd.Index([int(c) for c in df.columns])
     except Exception:
@@ -305,16 +254,6 @@ def load_pred_vtime_df(path: Path) -> pd.DataFrame:
 
 
 def dataframe_to_sparse_rows(df: pd.DataFrame) -> dict:
-    """
-    Convert one dataframe into a sparse row representation to reduce overhead.
-
-    Output:
-      {
-        "timestamps": [...],
-        "time_hours": np.ndarray shape (T,),
-        "rows": list[dict[int, float]] length T
-      }
-    """
     times = df.index
     time_hours = time_of_day_hours(times)
 
@@ -340,9 +279,6 @@ def build_time_series_cache(
     file_list: list[Path],
     cache_path: Path | None = None,
 ) -> list[dict]:
-    """
-    Build a cached sparse time-series representation for each file.
-    """
     if cache_path is not None and cache_path.exists():
         print(f"Loading cached time-series rows from: {cache_path}")
         with open(cache_path, "rb") as f:
@@ -381,13 +317,84 @@ def build_time_series_cache(
     return out
 
 
+def build_historical_mean_train_series(
+    train_series: list[dict],
+    allowed_nodes: set[int] | None = None,
+    synthetic_date: str = "2000-01-01",
+) -> list[dict]:
+    """
+    Build one synthetic training file by averaging the 70 training days.
+
+    For each time-of-day and node:
+        mean_value(time, node) = average over train files where that node exists.
+    """
+    sums_by_time = defaultdict(lambda: defaultdict(float))
+    counts_by_time = defaultdict(lambda: defaultdict(int))
+
+    for file_data in train_series:
+        rows = file_data["rows"]
+        time_hours = file_data["time_hours"]
+
+        for t_hour, row_values in zip(time_hours, rows):
+            time_key = int(round(float(t_hour) * 3600.0))
+
+            for node_id, value in row_values.items():
+                node_id = int(node_id)
+
+                if allowed_nodes is not None and node_id not in allowed_nodes:
+                    continue
+
+                sums_by_time[time_key][node_id] += float(value)
+                counts_by_time[time_key][node_id] += 1
+
+    if len(sums_by_time) == 0:
+        raise RuntimeError("Could not build historical mean series: no values found.")
+
+    sorted_time_keys = sorted(sums_by_time.keys())
+
+    timestamps = []
+    time_hours = []
+    mean_rows = []
+
+    base_date = pd.Timestamp(synthetic_date)
+
+    for time_key in sorted_time_keys:
+        timestamp = base_date + pd.Timedelta(seconds=int(time_key))
+        timestamps.append(timestamp)
+        time_hours.append(float(time_key) / 3600.0)
+
+        mean_row = {}
+
+        for node_id, total in sums_by_time[time_key].items():
+            count = counts_by_time[time_key][node_id]
+            if count > 0:
+                mean_row[int(node_id)] = float(total / count)
+
+        mean_rows.append(mean_row)
+
+    out = [{
+        "file": "historical_mean_train_70_days",
+        "timestamps": timestamps,
+        "time_hours": np.asarray(time_hours, dtype=np.float32),
+        "rows": mean_rows,
+    }]
+
+    print("\nBuilt historical-mean training series")
+    print(f"Original train files:       {len(train_series)}")
+    print(f"Synthetic mean files:       {len(out)}")
+    print(f"Synthetic timestamps:       {len(mean_rows)}")
+    print(f"Allowed nodes used:         {len(allowed_nodes) if allowed_nodes is not None else 'all'}")
+
+    non_empty_rows = sum(1 for row in mean_rows if len(row) > 0)
+    print(f"Non-empty mean rows:        {non_empty_rows}")
+
+    return out
+
+
 # ============================================================
 # GRAPH + SPECTRAL OBJECTS
 # ============================================================
 def load_graph(graph_path: Path) -> nx.Graph:
-    """
-    Load the canonical graph from disk.
-    """
     with open(graph_path, "rb") as f:
         G = pickle.load(f)
 
@@ -398,10 +405,6 @@ def load_graph(graph_path: Path) -> nx.Graph:
 
 
 def _load_node_to_pos(spectrum_dir: Path) -> dict[int, int]:
-    """
-    Prefer node_to_index.json because it is explicit.
-    Fall back to node_order.pt / node_order.npy if needed.
-    """
     json_path = spectrum_dir / "node_to_index.json"
     if json_path.exists():
         with open(json_path, "r") as f:
@@ -429,9 +432,6 @@ def _load_node_to_pos(spectrum_dir: Path) -> dict[int, int]:
 
 
 def _load_tensor_file(path: Path) -> torch.Tensor:
-    """
-    Load a tensor saved either as .pt or .npy.
-    """
     if path.suffix == ".pt":
         obj = torch.load(path, map_location=DEVICE)
         if isinstance(obj, torch.Tensor):
@@ -446,11 +446,6 @@ def _load_tensor_file(path: Path) -> torch.Tensor:
 
 
 def build_graph_objects(graph_path: Path, spectrum_dir: Path):
-    """
-    Load:
-      - graph topology from canonical_graph.gpickle
-      - precomputed spectral objects from graph_spectrum
-    """
     G = load_graph(graph_path)
 
     eigvals_path = spectrum_dir / "eigenvalues.pt"
@@ -470,7 +465,6 @@ def build_graph_objects(graph_path: Path, spectrum_dir: Path):
     eigenvectors = _load_tensor_file(eigvecs_path).to(DEVICE)
     node_to_pos = _load_node_to_pos(spectrum_dir)
 
-    # Basic consistency checks
     if eigenvalues.ndim != 1:
         raise ValueError(f"eigenvalues must be 1D, got shape {tuple(eigenvalues.shape)}")
     if eigenvectors.ndim != 2:
@@ -506,10 +500,6 @@ def get_degree_filtered_nodes(
     node_to_pos: dict[int, int],
     min_degree: int,
 ) -> set[int]:
-    """
-    Keep only nodes whose degree in the canonical graph is >= min_degree
-    and that are present in the spectral mapping.
-    """
     allowed = {
         int(n)
         for n, deg in G.degree()
@@ -531,12 +521,6 @@ def get_radius_filtered_nodes(
     radius_edges: int,
     local_min_degree: int = 0,
 ) -> set[int]:
-    """
-    Keep only nodes within radius_edges graph hops from central_node.
-
-    This creates a local graph ball:
-        allowed_nodes = {n : shortest_path_length(central_node, n) <= radius_edges}
-    """
     central_node = int(central_node)
 
     if central_node not in G:
@@ -612,9 +596,6 @@ def fit_standardization(
     train_series: list[dict],
     allowed_nodes: set[int],
 ) -> tuple[float, float]:
-    """
-    Fit normalization stats using only the allowed node subset.
-    """
     vals = []
 
     for file_data in train_series:
@@ -640,13 +621,6 @@ def sample_obs_target_split(
     obs_fraction: float,
     rng: np.random.Generator,
 ) -> tuple[list[int], list[int]]:
-    """
-    Randomly split available center-time nodes into:
-      - observed center nodes
-      - target center nodes
-
-    This is kept for fallback if fixed_observed_nodes is None.
-    """
     n = len(available_nodes)
     if n < 2:
         return [], []
@@ -685,14 +659,11 @@ def build_spatiotemporal_tasks(
     Build spatiotemporal reconstruction tasks.
 
     If fixed_observed_nodes is provided:
-      - observed nodes are the same for train/val/test
+      - observed nodes are the same across train/val/test
       - targets are all available non-observed nodes
 
     If fixed_observed_nodes is None:
       - original random mask behavior is used
-
-    Inputs are 2D points:
-      [node_position, time_hour]
     """
     tasks = []
     mapped_nodes = set(node_to_pos.keys())
@@ -747,14 +718,9 @@ def build_spatiotemporal_tasks(
 
                 obs_points = []
 
-                # Center-time observed points
                 for n in obs_center_nodes:
                     obs_points.append((int(n), center_time, float(center_row[n])))
 
-                # Neighbor-time observed points
-                #
-                # Preventing leakage:
-                # only use the same observed nodes as at the center timestamp.
                 neighbor_points = []
 
                 for ridx in range(left, right):
@@ -764,6 +730,8 @@ def build_spatiotemporal_tasks(
                     row_values = rows[ridx]
                     tval = float(time_hours[ridx])
 
+                    # Leakage-safe:
+                    # only the same fixed/observed nodes are available at neighbor times.
                     for n in obs_center_nodes:
                         if n in row_values:
                             neighbor_points.append(
@@ -824,14 +792,6 @@ def build_spatiotemporal_tasks(
 # SHARED CONDITIONAL SPATIOTEMPORAL GP MODEL
 # ============================================================
 class SharedConditionalSpatioTemporalGraphModel(torch.nn.Module):
-    """
-    Shared GraphTemporalKernel + shared constant mean + shared noise.
-
-    Input format:
-      x[..., 0] = node position in spectral ordering
-      x[..., 1] = time
-    """
-
     def __init__(
         self,
         eigenvalues: torch.Tensor,
@@ -850,10 +810,7 @@ class SharedConditionalSpatioTemporalGraphModel(torch.nn.Module):
             time_kernel=time_kernel,
         )
 
-        # Global mean for standardized process
         self.raw_mean = torch.nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
-
-        # Positive observation noise via softplus
         self.raw_noise = torch.nn.Parameter(torch.tensor(-2.0, dtype=torch.float32))
 
         self.base_jitter = float(base_jitter)
@@ -876,13 +833,6 @@ class SharedConditionalSpatioTemporalGraphModel(torch.nn.Module):
         y_obs: torch.Tensor,
         x_tgt: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Compute the predictive Gaussian distribution:
-
-            y_tgt | y_obs ~ N(pred_mean, pred_cov)
-
-        where both observed and target quantities are noisy observations.
-        """
         noise = self.noise
 
         K_oo = self._cov(x_obs, x_obs)
@@ -921,9 +871,6 @@ class SharedConditionalSpatioTemporalGraphModel(torch.nn.Module):
         y_tgt: torch.Tensor,
         normalize_by_targets: bool = True,
     ) -> torch.Tensor:
-        """
-        Negative log-likelihood for one spatiotemporal reconstruction task.
-        """
         pred_mean, pred_cov = self.conditional_distribution(x_obs, y_obs, x_tgt)
         dist = torch.distributions.MultivariateNormal(
             pred_mean,
@@ -950,13 +897,6 @@ def evaluate_tasks(
     split_name: str = "Eval",
     show_progress: bool = True,
 ) -> tuple[pd.DataFrame, list[dict]]:
-    """
-    Evaluate a list of tasks.
-
-    Returns:
-      - row-level dataframe with one row per predicted node
-      - covariance records, one per task
-    """
     model.eval()
 
     rows = []
@@ -1031,9 +971,6 @@ def evaluate_tasks(
 # MAIN
 # ============================================================
 def main():
-    # --------------------------------------------------------
-    # Files
-    # --------------------------------------------------------
     pickle_files = sorted(PICKLE_DIR.glob("*.pkl"))
     assert len(pickle_files) == 101, f"Expected 101 pickle files, found {len(pickle_files)}"
     assert TRAIN_FILES + VAL_FILES + TEST_FILES == 101
@@ -1050,9 +987,6 @@ def main():
     for fp in train_files[:3]:
         print("  ", fp.name)
 
-    # --------------------------------------------------------
-    # Graph objects
-    # --------------------------------------------------------
     G, node_to_pos, eigenvalues, eigenvectors = build_graph_objects(
         GRAPH_PATH,
         GRAPH_SPECTRUM_DIR,
@@ -1077,7 +1011,6 @@ def main():
             radius_edges=GRAPH_RADIUS_EDGES,
             local_min_degree=LOCAL_MIN_GRAPH_DEGREE,
         )
-
     else:
         central_node = None
 
@@ -1151,6 +1084,23 @@ def main():
     print(f"Val files loaded:   {len(val_series)}")
     print(f"Test files loaded:  {len(test_series)}")
 
+    train_series_raw = train_series
+
+    if USE_HISTORICAL_MEAN_TRAINING:
+        train_series_for_tasks = build_historical_mean_train_series(
+            train_series=train_series_raw,
+            allowed_nodes=allowed_nodes,
+            synthetic_date="2000-01-01",
+        )
+    else:
+        train_series_for_tasks = train_series_raw
+
+    train_tasks_source = (
+        "historical_mean_70_days"
+        if USE_HISTORICAL_MEAN_TRAINING
+        else "raw_train_days"
+    )
+
     # --------------------------------------------------------
     # W&B run
     # --------------------------------------------------------
@@ -1179,6 +1129,9 @@ def main():
                 "use_fixed_observed_nodes": USE_FIXED_OBSERVED_NODES,
                 "num_fixed_observed_nodes": len(fixed_observed_node_ids),
                 "fixed_observed_node_ids": fixed_observed_node_ids,
+
+                "use_historical_mean_training": USE_HISTORICAL_MEAN_TRAINING,
+                "train_tasks_source": train_tasks_source,
 
                 "temporal_window_steps": TEMPORAL_WINDOW_STEPS,
                 "center_time_stride": CENTER_TIME_STRIDE,
@@ -1211,23 +1164,17 @@ def main():
         )
 
     # --------------------------------------------------------
-    # Fit normalization on train only, using filtered nodes only
+    # Normalization
     # --------------------------------------------------------
-    y_mean, y_std = fit_standardization(train_series, allowed_nodes)
+    y_mean, y_std = fit_standardization(train_series_raw, allowed_nodes)
 
-    if USE_CENTRAL_NODE_RADIUS_FILTER:
-        print(
-            f"\nTrain normalization over radius-{GRAPH_RADIUS_EDGES} local nodes "
-            f"around central node {central_node}"
-        )
-    else:
-        print(f"\nTrain normalization over degree>={MIN_GRAPH_DEGREE} nodes only")
-
+    print("\nNormalization")
     print(f"Train normalization mean = {y_mean:.6f}")
     print(f"Train normalization std  = {y_std:.6f}")
+    print(f"Train task source        = {train_tasks_source}")
 
     # --------------------------------------------------------
-    # Build fixed validation / test tasks
+    # Build fixed validation / test tasks from real raw days
     # --------------------------------------------------------
     val_tasks = build_spatiotemporal_tasks(
         series_data=val_series,
@@ -1264,11 +1211,8 @@ def main():
     # --------------------------------------------------------
     # Build fixed train tasks once
     # --------------------------------------------------------
-    # No resampling:
-    #   - train tasks are built once
-    #   - the exact same fixed observed nodes are used for every split
     train_tasks = build_spatiotemporal_tasks(
-        series_data=train_series,
+        series_data=train_series_for_tasks,
         node_to_pos=node_to_pos,
         allowed_nodes=allowed_nodes,
         y_mean=y_mean,
@@ -1283,7 +1227,6 @@ def main():
         max_neighbor_points=MAX_NEIGHBOR_POINTS,
     )
 
-    # Fixed train subset used only for monitoring training prediction metrics.
     if len(train_tasks) > MAX_TRAIN_EVAL_TASKS:
         rng = np.random.default_rng(RANDOM_SEED + 123_456)
         chosen = rng.choice(
@@ -1310,14 +1253,12 @@ def main():
                 "y_mean": y_mean,
                 "y_std": y_std,
 
-                "use_central_node_radius_filter": USE_CENTRAL_NODE_RADIUS_FILTER,
-                "central_node_used": central_node,
-                "graph_radius_edges": GRAPH_RADIUS_EDGES,
-                "local_min_graph_degree": LOCAL_MIN_GRAPH_DEGREE,
-
                 "use_fixed_observed_nodes": USE_FIXED_OBSERVED_NODES,
                 "num_fixed_observed_nodes": len(fixed_observed_node_ids),
                 "fixed_observed_node_ids": fixed_observed_node_ids,
+
+                "num_train_series_raw": len(train_series_raw),
+                "num_train_series_for_tasks": len(train_series_for_tasks),
 
                 "resample_train_masks": RESAMPLE_TRAIN_MASKS,
                 "num_train_tasks": len(train_tasks),
@@ -1331,19 +1272,14 @@ def main():
 
     if len(train_tasks) == 0:
         raise RuntimeError(
-            "No training tasks were built for spatiotemporal reconstruction. Check:\n"
-            "  - local central-node radius may be too small\n"
-            "  - fixed observed nodes may not exist often enough\n"
-            "  - MIN_AVAILABLE_NODES may be too high\n"
-            "  - node id alignment\n"
-            "  - missingness in the rows\n"
-            "  - OBS_FRACTION\n"
-            "  - CENTER_TIME_STRIDE / TEMPORAL_WINDOW_STEPS"
+            "No training tasks were built. Check fixed observed nodes, local radius, "
+            "historical mean series, MIN_AVAILABLE_NODES, and missingness."
         )
 
     if len(val_tasks) == 0 or len(test_tasks) == 0:
         raise RuntimeError(
-            "Validation/test tasks are empty. Check local radius, fixed observed nodes, missingness, and MIN_AVAILABLE_NODES."
+            "Validation/test tasks are empty. Check fixed observed nodes, local radius, "
+            "missingness, and MIN_AVAILABLE_NODES."
         )
 
     # --------------------------------------------------------
@@ -1355,11 +1291,9 @@ def main():
         base_jitter=BASE_JITTER,
     ).to(DEVICE)
 
-    # Graph kernel hyperparameters
     model.kernel.graph_kernel.nu = 1.0
     model.kernel.graph_kernel.kappa = 1.0
 
-    # Time kernel hyperparameters
     model.kernel.time_kernel.base_kernel.lengthscale = 1.0
     model.kernel.time_kernel.outputscale = 1.0
 
@@ -1381,9 +1315,6 @@ def main():
 
     for epoch in epoch_bar:
         model.train()
-
-        if len(train_tasks) == 0:
-            raise RuntimeError("No fixed training tasks were built.")
 
         running_loss = 0.0
         seen_tasks = 0
@@ -1429,9 +1360,6 @@ def main():
 
         avg_train_loss = running_loss / max(seen_tasks, 1)
 
-        # -------------------------
-        # Train evaluation
-        # -------------------------
         train_eval_df, _ = evaluate_tasks(
             model=model,
             tasks=train_eval_tasks,
@@ -1444,9 +1372,6 @@ def main():
 
         train_eval_metrics = compute_metrics(train_eval_df, scale=y_std)
 
-        # -------------------------
-        # Validation
-        # -------------------------
         val_df, _ = evaluate_tasks(
             model=model,
             tasks=val_tasks,
@@ -1484,10 +1409,12 @@ def main():
             "use_central_node_radius_filter": bool(USE_CENTRAL_NODE_RADIUS_FILTER),
             "central_node_used": int(central_node) if central_node is not None else None,
             "graph_radius_edges": int(GRAPH_RADIUS_EDGES),
-            "local_min_graph_degree": int(LOCAL_MIN_GRAPH_DEGREE),
 
             "use_fixed_observed_nodes": bool(USE_FIXED_OBSERVED_NODES),
             "num_fixed_observed_nodes": int(len(fixed_observed_node_ids)),
+
+            "use_historical_mean_training": bool(USE_HISTORICAL_MEAN_TRAINING),
+            "train_tasks_source": train_tasks_source,
 
             "resample_train_masks": bool(RESAMPLE_TRAIN_MASKS),
             "num_train_tasks": int(len(train_tasks)),
@@ -1540,10 +1467,12 @@ def main():
                     "graph/use_central_node_radius_filter": bool(USE_CENTRAL_NODE_RADIUS_FILTER),
                     "graph/central_node_used": int(central_node) if central_node is not None else -1,
                     "graph/radius_edges": int(GRAPH_RADIUS_EDGES),
-                    "graph/local_min_degree": int(LOCAL_MIN_GRAPH_DEGREE),
 
                     "obs/use_fixed_observed_nodes": bool(USE_FIXED_OBSERVED_NODES),
                     "obs/num_fixed_observed_nodes": int(len(fixed_observed_node_ids)),
+
+                    "training/use_historical_mean_training": bool(USE_HISTORICAL_MEAN_TRAINING),
+                    "training/train_tasks_source": train_tasks_source,
 
                     "tasks/resample_train_masks": bool(RESAMPLE_TRAIN_MASKS),
                     "tasks/num_train_tasks": int(len(train_tasks)),
@@ -1631,13 +1560,11 @@ def main():
                 "final/best_epoch": int(best_epoch),
                 "final/best_val_rmse": float(best_val_rmse),
 
-                "final/resample_train_masks": bool(RESAMPLE_TRAIN_MASKS),
-                "final/use_central_node_radius_filter": bool(USE_CENTRAL_NODE_RADIUS_FILTER),
-                "final/central_node_used": int(central_node) if central_node is not None else -1,
-                "final/graph_radius_edges": int(GRAPH_RADIUS_EDGES),
-
                 "final/use_fixed_observed_nodes": bool(USE_FIXED_OBSERVED_NODES),
                 "final/num_fixed_observed_nodes": int(len(fixed_observed_node_ids)),
+
+                "final/use_historical_mean_training": bool(USE_HISTORICAL_MEAN_TRAINING),
+                "final/train_tasks_source": train_tasks_source,
             }
         )
 
@@ -1645,12 +1572,10 @@ def main():
         wandb.summary["best_val_rmse"] = float(best_val_rmse)
         wandb.summary["test_nmae"] = float(test_metrics["nmae"])
         wandb.summary["test_nrmse"] = float(test_metrics["nrmse"])
-        wandb.summary["resample_train_masks"] = bool(RESAMPLE_TRAIN_MASKS)
-        wandb.summary["use_central_node_radius_filter"] = bool(USE_CENTRAL_NODE_RADIUS_FILTER)
-        wandb.summary["central_node_used"] = int(central_node) if central_node is not None else -1
-        wandb.summary["graph_radius_edges"] = int(GRAPH_RADIUS_EDGES)
         wandb.summary["use_fixed_observed_nodes"] = bool(USE_FIXED_OBSERVED_NODES)
         wandb.summary["num_fixed_observed_nodes"] = int(len(fixed_observed_node_ids))
+        wandb.summary["use_historical_mean_training"] = bool(USE_HISTORICAL_MEAN_TRAINING)
+        wandb.summary["train_tasks_source"] = train_tasks_source
 
     print("\nValidation")
     print(f"MAE:   {val_metrics['mae']:.4f}")
@@ -1685,6 +1610,7 @@ def main():
         f"outputs_spatiotemporal_gp_central_{CENTRAL_NODE_ID}"
         f"_r_{GRAPH_RADIUS_EDGES}"
         f"_fixed_obs"
+        f"_histmean_train"
         f"_no_resampling"
     )
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1711,6 +1637,9 @@ def main():
 
             "use_fixed_observed_nodes": USE_FIXED_OBSERVED_NODES,
             "fixed_observed_node_ids": fixed_observed_node_ids,
+
+            "use_historical_mean_training": USE_HISTORICAL_MEAN_TRAINING,
+            "train_tasks_source": train_tasks_source,
 
             "resample_train_masks": RESAMPLE_TRAIN_MASKS,
 
@@ -1756,6 +1685,9 @@ def main():
 
                 "use_fixed_observed_nodes": USE_FIXED_OBSERVED_NODES,
                 "num_fixed_observed_nodes": len(fixed_observed_node_ids),
+
+                "use_historical_mean_training": USE_HISTORICAL_MEAN_TRAINING,
+                "train_tasks_source": train_tasks_source,
 
                 "temporal_window_steps": TEMPORAL_WINDOW_STEPS,
                 "center_time_stride": CENTER_TIME_STRIDE,
